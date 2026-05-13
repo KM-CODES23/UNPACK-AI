@@ -1,0 +1,11 @@
+# Server secrets
+.env
+.env.*
+!.env.example
+
+# Server dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.log
+

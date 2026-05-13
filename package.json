@@ -1,0 +1,13 @@
+{
+  "name": "unpack-ai-project",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm --prefix unpackai/server run dev\" \"npm --prefix unpackai/client run dev\"",
+    "build": "npm --prefix unpackai/client run build",
+    "check": "npm --prefix unpackai/server run check"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
