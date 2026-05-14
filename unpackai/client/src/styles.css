@@ -30,3 +30,10 @@ h3::selection,
 span::selection {
   background: rgba(56, 189, 248, 0.35);
 }
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
