@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -21,6 +22,9 @@ const HF_TOKEN = process.env.HF_TOKEN;
 const HF_MODEL = process.env.HF_MODEL || "google/flan-t5-large";
 const HF_API_URL =
   process.env.HF_API_URL || `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_REST_URL = SUPABASE_URL ? `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1` : "";
 const MAX_ASSIGNMENT_LENGTH = 12000;
 const MIN_ASSIGNMENT_LENGTH = 10;
 
@@ -57,7 +61,173 @@ app.get("/health", (req, res) => {
     hasGeminiKey: Boolean(GEMINI_API_KEY),
     hasOpenAIKey: Boolean(OPENAI_API_KEY),
     hasHuggingFaceToken: Boolean(HF_TOKEN),
+    hasDatabase: isSupabaseConfigured(),
   });
+});
+
+app.post("/api/auth/signup", async (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ error: "Supabase is not configured on the server." });
+  }
+
+  const name = cleanText(req.body?.name);
+  const email = cleanText(req.body?.email).toLowerCase();
+  const password = String(req.body?.password || "");
+
+  if (!name || !email || password.length < 6) {
+    return res.status(400).json({ error: "Name, valid email, and 6+ character password are required." });
+  }
+
+  try {
+    const existing = await supabaseSelect("app_users", `select=id&email=eq.${encodeURIComponent(email)}&limit=1`);
+
+    if (existing.length) {
+      return res.status(409).json({ error: "An account with that email already exists." });
+    }
+
+    const passwordHash = hashPassword(password);
+    const [user] = await supabaseInsert("app_users", {
+      name,
+      email,
+      password_hash: passwordHash,
+      institution: "",
+      course: "",
+    });
+    const settings = await ensureSettings(user.id);
+    const session = await createSession(user.id);
+
+    return res.status(201).json({
+      token: session.token,
+      user: sanitizeUser(user),
+      settings,
+      history: [],
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to create account.", details: getSupabaseError(error) });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ error: "Supabase is not configured on the server." });
+  }
+
+  const email = cleanText(req.body?.email).toLowerCase();
+  const password = String(req.body?.password || "");
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+
+  try {
+    const [user] = await supabaseSelect("app_users", `select=*&email=eq.${encodeURIComponent(email)}&limit=1`);
+
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    const settings = await ensureSettings(user.id);
+    const history = await getHistory(user.id);
+    const session = await createSession(user.id);
+
+    return res.json({
+      token: session.token,
+      user: sanitizeUser(user),
+      settings,
+      history,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to sign in.", details: getSupabaseError(error) });
+  }
+});
+
+app.get("/api/me", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  const settings = await ensureSettings(auth.user.id);
+  const history = await getHistory(auth.user.id);
+
+  return res.json({
+    user: sanitizeUser(auth.user),
+    settings,
+    history,
+  });
+});
+
+app.put("/api/profile", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  const updates = {
+    name: cleanText(req.body?.name) || auth.user.name,
+    email: cleanText(req.body?.email).toLowerCase() || auth.user.email,
+    institution: cleanText(req.body?.institution),
+    course: cleanText(req.body?.course),
+  };
+
+  try {
+    const [user] = await supabasePatch("app_users", `id=eq.${auth.user.id}`, updates);
+    return res.json({ user: sanitizeUser(user) });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to update profile.", details: getSupabaseError(error) });
+  }
+});
+
+app.put("/api/settings", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  const nextSettings = {
+    academic_level: cleanText(req.body?.academicLevel) || "University",
+    referencing_style: cleanText(req.body?.referencingStyle) || "Harvard",
+    language: cleanText(req.body?.language) || "English",
+    save_history: Boolean(req.body?.saveHistory),
+    compact_mode: Boolean(req.body?.compactMode),
+  };
+
+  try {
+    const [settings] = await supabasePatch("user_settings", `user_id=eq.${auth.user.id}`, nextSettings);
+    return res.json({ settings: mapSettings(settings) });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to update settings.", details: getSupabaseError(error) });
+  }
+});
+
+app.get("/api/history", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  return res.json({ history: await getHistory(auth.user.id) });
+});
+
+app.post("/api/history", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  try {
+    const [item] = await supabaseInsert("assignment_analyses", {
+      user_id: auth.user.id,
+      assignment: String(req.body?.assignment || "").slice(0, 12000),
+      breakdown: req.body?.breakdown || {},
+    });
+
+    return res.status(201).json({ item: mapHistoryItem(item) });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to save analysis.", details: getSupabaseError(error) });
+  }
+});
+
+app.delete("/api/history", async (req, res) => {
+  const auth = await requireSession(req, res);
+  if (!auth) return;
+
+  try {
+    await supabaseDelete("assignment_analyses", `user_id=eq.${auth.user.id}`);
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to clear history.", details: getSupabaseError(error) });
+  }
 });
 
 app.post("/api/breakdown", async (req, res) => {
@@ -854,6 +1024,175 @@ function mapAuthenticationError(error) {
         : "Hugging Face rejected the server token. Check HF_TOKEN in .env.",
     details: "AI provider authentication failed.",
   };
+}
+
+function isSupabaseConfigured() {
+  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function supabaseHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    ...extra,
+  };
+}
+
+async function supabaseSelect(table, query = "select=*") {
+  const response = await axios.get(`${SUPABASE_REST_URL}/${table}?${query}`, {
+    headers: supabaseHeaders(),
+    timeout: 15000,
+  });
+  return response.data || [];
+}
+
+async function supabaseInsert(table, payload) {
+  const response = await axios.post(`${SUPABASE_REST_URL}/${table}`, payload, {
+    headers: supabaseHeaders({ Prefer: "return=representation" }),
+    timeout: 15000,
+  });
+  return response.data || [];
+}
+
+async function supabasePatch(table, filter, payload) {
+  const response = await axios.patch(`${SUPABASE_REST_URL}/${table}?${filter}`, payload, {
+    headers: supabaseHeaders({ Prefer: "return=representation" }),
+    timeout: 15000,
+  });
+  return response.data || [];
+}
+
+async function supabaseDelete(table, filter) {
+  const response = await axios.delete(`${SUPABASE_REST_URL}/${table}?${filter}`, {
+    headers: supabaseHeaders(),
+    timeout: 15000,
+  });
+  return response.data;
+}
+
+async function requireSession(req, res) {
+  if (!isSupabaseConfigured()) {
+    res.status(503).json({ error: "Supabase is not configured on the server." });
+    return null;
+  }
+
+  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+
+  if (!token) {
+    res.status(401).json({ error: "Authentication token is required." });
+    return null;
+  }
+
+  try {
+    const [session] = await supabaseSelect("app_sessions", `select=*,app_users(*)&token=eq.${encodeURIComponent(token)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&limit=1`);
+
+    if (!session?.app_users) {
+      res.status(401).json({ error: "Session expired or invalid." });
+      return null;
+    }
+
+    return {
+      session,
+      user: session.app_users,
+    };
+  } catch (error) {
+    res.status(500).json({ error: "Failed to verify session.", details: getSupabaseError(error) });
+    return null;
+  }
+}
+
+async function createSession(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString();
+  const [session] = await supabaseInsert("app_sessions", {
+    user_id: userId,
+    token,
+    expires_at: expiresAt,
+  });
+  return session;
+}
+
+async function ensureSettings(userId) {
+  const [existing] = await supabaseSelect("user_settings", `select=*&user_id=eq.${userId}&limit=1`);
+
+  if (existing) {
+    return mapSettings(existing);
+  }
+
+  const [created] = await supabaseInsert("user_settings", {
+    user_id: userId,
+    academic_level: "University",
+    referencing_style: "Harvard",
+    language: "English",
+    save_history: true,
+    compact_mode: false,
+  });
+
+  return mapSettings(created);
+}
+
+async function getHistory(userId) {
+  const rows = await supabaseSelect(
+    "assignment_analyses",
+    `select=*&user_id=eq.${userId}&order=created_at.desc&limit=8`
+  );
+  return rows.map(mapHistoryItem);
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, "sha256").toString("hex");
+  return `pbkdf2:${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash = "") {
+  const [, salt, hash] = storedHash.split(":");
+
+  if (!salt || !hash) {
+    return false;
+  }
+
+  const attempted = crypto.pbkdf2Sync(password, salt, 120000, 32, "sha256").toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(attempted, "hex"));
+}
+
+function sanitizeUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    institution: user.institution || "",
+    course: user.course || "",
+    createdAt: user.created_at,
+  };
+}
+
+function mapSettings(row) {
+  return {
+    academicLevel: row.academic_level,
+    referencingStyle: row.referencing_style,
+    language: row.language,
+    saveHistory: row.save_history,
+    compactMode: row.compact_mode,
+  };
+}
+
+function mapHistoryItem(row) {
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    assignment: row.assignment,
+    breakdown: row.breakdown,
+  };
+}
+
+function cleanText(value) {
+  return String(value || "").trim();
+}
+
+function getSupabaseError(error) {
+  return error.response?.data?.message || error.response?.data || error.message;
 }
 
 function shouldUseLocalFallback(error) {
