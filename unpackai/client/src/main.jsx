@@ -1133,7 +1133,7 @@ function SettingsPage({ health, onRefreshHealth, onSave, settings }) {
 
 /* =====================================================================
    Form fields
-   ===================================================================== */
+   ==================================================================== */
 
 function Field({ label, onChange, type = "text", value, ...rest }) {
   return (
