@@ -1,266 +1,251 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  AlertCircle,
-  Bell,
-  BookOpenCheck,
-  BrainCircuit,
-  CheckCircle2,
-  ClipboardList,
-  Copy,
-  Download,
-  FileText,
-  GraduationCap,
-  History,
-  Loader2,
-  LogOut,
-  Map,
-  PanelLeft,
-  RotateCcw,
-  Save,
-  Search,
-  Send,
-  Settings,
-  Shield,
-  Sparkles,
-  Target,
-  Trash2,
-  Upload,
-  User,
-  Wifi,
-  WifiOff,
-  X,
-} from "lucide-react";
+import { Bell, Check, Copy, Download, FileUp, Link2, Loader2, LogOut, Phone, RotateCcw, Trash2, X } from "lucide-react";
 import logo from "./assets/unpack-logo.jpeg";
-import referenceImage from "./assets/interface-reference.png";
+import { applyRemoteConfig, config } from "./config";
+import {
+  acceptAttribute,
+  apiRequest,
+  asArray,
+  buildContextualAssignment,
+  countWords,
+  createMarkdown,
+  formatDate,
+  hasAllowedExtension,
+  initials,
+  loadJson,
+  nameToHue,
+  removeKeys,
+  saveJson,
+  slugify,
+  uid,
+} from "./lib";
 import "./styles.css";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
-const HISTORY_KEY = "unpackai.analysisHistory.v1";
-const USERS_KEY = "unpackai.users.v1";
-const SESSION_KEY = "unpackai.session.v1";
-const SETTINGS_KEY = "unpackai.settings.v1";
-const NOTIFICATIONS_KEY = "unpackai.notifications.v1";
+const { brand, copy, defaultSettings, documents, features, limits, options, sampleBrief, storageKeys } = config;
 
-const defaultSettings = {
-  academicLevel: "University",
-  referencingStyle: "Harvard",
-  language: "English",
-  saveHistory: true,
-  compactMode: false,
-};
-
-const sampleAssignment =
-  "Discuss how artificial intelligence can improve academic support for South African university students. Your essay should identify the main challenges students face, explain relevant AI tools, evaluate ethical concerns, and propose practical recommendations. Use at least five academic sources and follow Harvard referencing.";
+const NAV = [
+  { id: "workspace", label: "Workspace" },
+  { id: "profile", label: "Profile" },
+  { id: "settings", label: "Settings" },
+];
 
 function App() {
-  const [session, setSession] = useState(() => loadJson(SESSION_KEY, null));
-  const [users, setUsers] = useState(() => loadJson(USERS_KEY, []));
-  const [settings, setSettings] = useState(() => ({ ...defaultSettings, ...loadJson(SETTINGS_KEY, {}) }));
+  const [session, setSession] = useState(() => loadJson(storageKeys.session, null));
+  const [settings, setSettings] = useState(() => ({ ...defaultSettings, ...loadJson(storageKeys.settings, {}) }));
+  const [history, setHistory] = useState(() => asArray(loadJson(storageKeys.history, [])));
+  const [notifications, setNotifications] = useState(() => asArray(loadJson(storageKeys.notifications, [])));
   const [assignment, setAssignment] = useState("");
   const [breakdown, setBreakdown] = useState(null);
+  const [resultId, setResultId] = useState(0);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [history, setHistory] = useState(() => loadHistory());
-  const [health, setHealth] = useState({ state: "checking", label: "Checking provider..." });
-  const [activeView, setActiveView] = useState("workspace");
-  const [notifications, setNotifications] = useState(() => loadJson(NOTIFICATIONS_KEY, []));
+  const [health, setHealth] = useState({ state: "checking", provider: "" });
+  const [view, setView] = useState("workspace");
   const [showNotifications, setShowNotifications] = useState(false);
-  const [toast, setToast] = useState("");
-  const workspaceRef = useRef(null);
-  const briefRef = useRef(null);
-  const tasksRef = useRef(null);
-  const roadmapRef = useRef(null);
+  const [toast, setToast] = useState(null);
+  const [, setConfigVersion] = useState(0);
+  const [booting, setBooting] = useState(Boolean(session?.token && !session?.user));
+  const toastTimer = useRef(null);
 
-  const currentUser = users.find((user) => user.id === session?.userId) || null;
+  const token = session?.token;
+  const user = session?.user;
   const unreadCount = notifications.filter((item) => !item.read).length;
-  const wordCount = useMemo(() => (assignment.trim() ? assignment.trim().split(/\s+/).length : 0), [assignment]);
 
+  /* ---------- persistence ---------- */
+  useEffect(() => saveJson(storageKeys.session, session), [session]);
+  useEffect(() => saveJson(storageKeys.settings, settings), [settings]);
+  useEffect(() => saveJson(storageKeys.history, history.slice(0, limits.historyItems)), [history]);
+  useEffect(() => saveJson(storageKeys.notifications, notifications.slice(0, limits.notificationItems)), [notifications]);
+
+  /* ---------- startup ---------- */
   useEffect(() => {
+    removeKeys(config.legacyStorageKeys);
+    loadRemoteConfig();
     checkHealth();
-  }, []);
-
-  useEffect(() => {
     restoreSession();
+
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    const accessToken = params.get("access_token");
+    if (accessToken) {
+      handleOAuthToken(accessToken);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(USERS_KEY, JSON.stringify(users));
-  }, [users]);
+    if (!showNotifications) return undefined;
+    const onKey = (event) => event.key === "Escape" && setShowNotifications(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showNotifications]);
 
-  useEffect(() => {
-    if (session) {
-      window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-    } else {
-      window.localStorage.removeItem(SESSION_KEY);
-    }
-  }, [session]);
+  /* ---------- small helpers ---------- */
+  const showToast = useCallback((message, type = "info") => {
+    setToast({ message, type });
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), limits.toastMs);
+  }, []);
 
-  useEffect(() => {
-    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  }, [settings]);
-
-  useEffect(() => {
-    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 8)));
-  }, [history]);
-
-  useEffect(() => {
-    window.localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(notifications.slice(0, 20)));
-  }, [notifications]);
-
-  if (!currentUser) {
-    return (
-      <AppShell>
-        <AuthScreen
-          onLogin={handleLogin}
-          onSignup={handleSignup}
-          toast={toast}
-        />
-      </AppShell>
+  function addNotification(title, message, type = "info") {
+    setNotifications((items) =>
+      [{ id: uid(), title, message, type, read: false, createdAt: new Date().toISOString() }, ...items].slice(
+        0,
+        limits.notificationItems,
+      ),
     );
   }
 
-  async function checkHealth() {
-    setHealth({ state: "checking", label: "Checking provider..." });
+  function showResult(data) {
+    setBreakdown(data);
+    setResultId((value) => value + 1);
+  }
 
+  function applyAccount(data) {
+    setSettings({ ...defaultSettings, ...(data.settings || {}) });
+    setHistory(asArray(data.history));
+  }
+
+  function signIn(data) {
+    setSession({ token: data.token, user: data.user });
+    applyAccount(data);
+    addNotification("Signed in", `Welcome back, ${data.user.name}.`);
+    showToast(data.databaseWarning || "Signed in");
+  }
+
+  /* ---------- server status + session ---------- */
+  async function loadRemoteConfig() {
     try {
-      const response = await fetch(`${API_BASE_URL}/health`);
-      const data = await response.json();
+      applyRemoteConfig(await apiRequest("/api/config"));
+      document.title = brand.name;
+      setConfigVersion((value) => value + 1);
+    } catch {
+      // The defaults from config.js and .env stay in place.
+    }
+  }
 
-      if (!response.ok) {
-        throw new Error("Backend health check failed.");
-      }
-
-      setHealth({
-        state: "online",
-        label: `${data.provider || "AI"} ready`,
-        data,
-      });
-    } catch (healthError) {
-      setHealth({
-        state: "offline",
-        label: "Backend offline",
-        data: { error: healthError.message },
-      });
+  async function checkHealth() {
+    setHealth((current) => ({ ...current, state: "checking" }));
+    try {
+      const data = await apiRequest("/health");
+      setHealth({ state: "online", provider: data.provider || "", data });
+    } catch {
+      setHealth({ state: "offline", provider: "" });
     }
   }
 
   async function restoreSession() {
-    if (!session?.token) {
-      return;
-    }
-
+    if (!session?.token) return;
     try {
-      const data = await apiRequest("/api/me", {
-        headers: authHeaders(session.token),
-      });
-      setUsers((items) => upsertUser(items, data.user));
-      setSettings({ ...defaultSettings, ...data.settings });
-      setHistory(data.history || []);
-    } catch {
-      // Keep the local session fallback for offline demos.
+      const data = await apiRequest("/api/me", { token: session.token });
+      setSession((current) => (current ? { ...current, user: data.user } : current));
+      if (data.settings) setSettings({ ...defaultSettings, ...data.settings });
+      if (data.history) setHistory(asArray(data.history));
+    } catch (requestError) {
+      // Only drop the session when the server says it's invalid.
+      // If the server is just unreachable, keep the cached user.
+      if (requestError.status === 401 || requestError.status === 403) setSession(null);
+    } finally {
+      setBooting(false);
     }
   }
 
-  async function handleSignup(details) {
-    const name = details.name.trim();
-    const email = details.email.trim().toLowerCase();
-    const password = details.password.trim();
+  /* ---------- auth ---------- */
+  async function handleOAuthToken(accessToken) {
+    try {
+      signIn(await apiRequest("/api/auth/supabase-session", { method: "POST", body: JSON.stringify({ accessToken }) }));
+    } catch (requestError) {
+      showToast(requestError.message, "error");
+    }
+  }
 
-    if (!name || !email || password.length < 6) {
-      showToast("Enter a name, email, and 6+ character password", "error");
+  async function handleLogin({ email, password }) {
+    try {
+      const data = await apiRequest("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password: password.trim() }),
+      });
+      signIn(data);
+    } catch (requestError) {
+      showToast(requestError.message, "error");
+    }
+  }
+
+  async function handleSignup({ name, email, password }) {
+    const cleanName = name.trim();
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanPassword = password.trim();
+
+    if (!cleanName || !cleanEmail || cleanPassword.length < limits.minPasswordLength) {
+      showToast(copy.errors.signupFields(limits.minPasswordLength), "error");
       return;
     }
 
     try {
       const data = await apiRequest("/api/auth/signup", {
         method: "POST",
-        body: JSON.stringify({ name, email, password }),
+        body: JSON.stringify({ name: cleanName, email: cleanEmail, password: cleanPassword }),
       });
-      setUsers((items) => upsertUser(items, data.user));
-      setSettings({ ...defaultSettings, ...data.settings });
-      setHistory(data.history || []);
-      setSession({ userId: data.user.id, token: data.token, signedInAt: new Date().toISOString() });
-      addNotification("Welcome to Unpack.ai", "Your Supabase account is ready.");
-      showToast("Account created");
-      return;
-    } catch (apiError) {
-      if (!isDatabaseUnavailable(apiError)) {
-        showToast(apiError.message, "error");
-        return;
-      }
+      signIn(data);
+      addNotification(`Welcome to ${brand.name}`, "Your account is ready.");
+    } catch (requestError) {
+      showToast(requestError.message, "error");
     }
-
-    if (users.some((user) => user.email === email)) {
-      showToast("An account with that email already exists", "error");
-      return;
-    }
-
-    const user = {
-      id: crypto.randomUUID(),
-      name,
-      email,
-      password,
-      institution: "",
-      course: "",
-      avatarColor: "from-cyan-300 to-violet-500",
-      createdAt: new Date().toISOString(),
-    };
-
-    setUsers((items) => [...items, user]);
-    setSession({ userId: user.id, signedInAt: new Date().toISOString() });
-    addNotification("Local account created", "Supabase is not configured, so this account is stored in this browser.");
-    showToast("Account created");
   }
 
-  async function handleLogin(details) {
-    const email = details.email.trim().toLowerCase();
-    const password = details.password.trim();
-
+  async function handleGoogle() {
     try {
-      const data = await apiRequest("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email, password }),
-      });
-      setUsers((items) => upsertUser(items, data.user));
-      setSettings({ ...defaultSettings, ...data.settings });
-      setHistory(data.history || []);
-      setSession({ userId: data.user.id, token: data.token, signedInAt: new Date().toISOString() });
-      addNotification("Signed in", `Welcome back, ${data.user.name}.`);
-      showToast("Signed in");
-      return;
-    } catch (apiError) {
-      if (!isDatabaseUnavailable(apiError)) {
-        showToast(apiError.message, "error");
+      const data = await apiRequest("/api/auth/providers");
+      if (!data.googleUrl) {
+        showToast(copy.errors.googleUnavailable, "error");
         return;
       }
+      window.location.href = data.googleUrl;
+    } catch (requestError) {
+      showToast(requestError.message, "error");
     }
+  }
 
-    const user = users.find((item) => item.email === email && item.password === password);
-
-    if (!user) {
-      showToast("Invalid email or password", "error");
-      return;
+  async function handlePhoneStart(phone) {
+    try {
+      await apiRequest("/api/auth/phone/start", { method: "POST", body: JSON.stringify({ phone }) });
+      showToast("Verification code sent");
+      return true;
+    } catch (requestError) {
+      showToast(requestError.message, "error");
+      return false;
     }
+  }
 
-    setSession({ userId: user.id, signedInAt: new Date().toISOString() });
-    addNotification("Signed in", `Welcome back, ${user.name}.`);
-    showToast("Signed in");
+  async function handlePhoneVerify(phone, code) {
+    try {
+      signIn(await apiRequest("/api/auth/phone/verify", { method: "POST", body: JSON.stringify({ phone, token: code }) }));
+    } catch (requestError) {
+      showToast(requestError.message, "error");
+    }
   }
 
   function logout() {
+    if (token) apiRequest("/api/auth/logout", { method: "POST", token }).catch(() => {});
     setSession(null);
-    setActiveView("workspace");
+    setHistory([]);
+    setNotifications([]);
+    setAssignment("");
+    setBreakdown(null);
+    setError("");
+    setShowNotifications(false);
+    setView("workspace");
     showToast("Signed out");
   }
 
-  async function analyzeAssignment(event) {
+  /* ---------- analysis ---------- */
+  async function analyze(event) {
     event?.preventDefault();
-
     const trimmed = assignment.trim();
 
-    if (trimmed.length < 10) {
-      setError("Paste at least 10 characters from your assignment brief.");
+    if (trimmed.length < limits.minBriefChars) {
+      setError(copy.errors.briefTooShort(limits.minBriefChars));
       setBreakdown(null);
       return;
     }
@@ -269,1068 +254,962 @@ function App() {
     setError("");
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/breakdown`, {
+      const data = await apiRequest("/api/breakdown", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          assignment: buildContextualAssignment(trimmed, settings),
-        }),
+        token,
+        body: JSON.stringify({ assignment: buildContextualAssignment(trimmed, settings) }),
       });
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(data.error || "Could not analyze the assignment.");
-      }
-
-      setBreakdown(data);
+      showResult(data);
 
       if (settings.saveHistory) {
-        const historyItem = {
-            id: crypto.randomUUID(),
-            createdAt: new Date().toISOString(),
-            assignment: trimmed,
-            breakdown: data,
-        };
-        setHistory((items) => [historyItem, ...items].slice(0, 8));
+        const item = { id: uid(), createdAt: new Date().toISOString(), assignment: trimmed, breakdown: data };
+        setHistory((items) => [item, ...items].slice(0, limits.historyItems));
 
-        if (session?.token) {
-          apiRequest("/api/history", {
-            method: "POST",
-            headers: authHeaders(session.token),
-            body: JSON.stringify({ assignment: trimmed, breakdown: data }),
-          })
+        if (token) {
+          apiRequest("/api/history", { method: "POST", token, body: JSON.stringify({ assignment: trimmed, breakdown: data }) })
             .then((saved) => {
               if (saved.item) {
-                setHistory((items) => [saved.item, ...items.filter((item) => item.id !== historyItem.id)].slice(0, 8));
+                setHistory((items) => [saved.item, ...items.filter((entry) => entry.id !== item.id)].slice(0, limits.historyItems));
               }
             })
             .catch(() => {});
         }
       }
 
-      addNotification("Breakdown complete", data.mainTopic || "Your assignment was analyzed.");
-      showToast("Breakdown created");
+      addNotification("Breakdown ready", data.mainTopic || "Your brief was analyzed.");
     } catch (requestError) {
+      if (requestError.status === 401) setSession(null);
       setBreakdown(null);
-      setError(requestError.message);
+      setError(requestError.message || copy.errors.analyze);
       addNotification("Analysis failed", requestError.message, "error");
     } finally {
       setIsLoading(false);
     }
   }
 
-  async function updateProfile(nextUser) {
-    if (session?.token) {
-      try {
-        const data = await apiRequest("/api/profile", {
-          method: "PUT",
-          headers: authHeaders(session.token),
-          body: JSON.stringify(nextUser),
-        });
-        setUsers((items) => upsertUser(items, data.user));
-        addNotification("Profile updated", "Your Supabase profile changes were saved.");
-        showToast("Profile saved");
-        return;
-      } catch (apiError) {
-        showToast(apiError.message, "error");
-        return;
-      }
-    }
-
-    setUsers((items) => items.map((item) => (item.id === currentUser.id ? { ...item, ...nextUser } : item)));
-    addNotification("Profile updated", "Your profile changes were saved.");
-    showToast("Profile saved");
-  }
-
-  async function updateSettings(nextSettings) {
-    if (session?.token) {
-      try {
-        const data = await apiRequest("/api/settings", {
-          method: "PUT",
-          headers: authHeaders(session.token),
-          body: JSON.stringify(nextSettings),
-        });
-        setSettings({ ...defaultSettings, ...data.settings });
-        addNotification("Settings updated", "Your Supabase workspace preferences were saved.");
-        showToast("Settings saved");
-        return;
-      } catch (apiError) {
-        showToast(apiError.message, "error");
-        return;
-      }
-    }
-
-    setSettings(nextSettings);
-    addNotification("Settings updated", "Your workspace preferences were saved.");
-    showToast("Settings saved");
-  }
-
-  function useSample() {
-    setAssignment(sampleAssignment);
-    setError("");
-    showToast("Sample loaded");
-  }
-
   function clearWorkspace() {
     setAssignment("");
     setBreakdown(null);
     setError("");
-    showToast("Workspace cleared");
   }
 
   function loadHistoryItem(item) {
     setAssignment(item.assignment);
-    setBreakdown(item.breakdown);
+    showResult(item.breakdown);
     setError("");
-    setActiveView("workspace");
-    scrollTo(workspaceRef);
-    showToast("History item loaded");
+    setView("workspace");
   }
 
   function clearHistory() {
     setHistory([]);
-    if (session?.token) {
-      apiRequest("/api/history", {
-        method: "DELETE",
-        headers: authHeaders(session.token),
-      }).catch(() => {});
-    }
-    addNotification("History cleared", "Saved analyses were removed from this browser.");
+    if (token) apiRequest("/api/history", { method: "DELETE", token }).catch(() => {});
     showToast("History cleared");
   }
 
-  function markNotificationsRead() {
-    setNotifications((items) => items.map((item) => ({ ...item, read: true })));
-  }
-
-  function clearNotifications() {
-    setNotifications([]);
-    showToast("Notifications cleared");
-  }
-
-  function addNotification(title, message, type = "info") {
-    setNotifications((items) => [
-      {
-        id: crypto.randomUUID(),
-        title,
-        message,
-        type,
-        read: false,
-        createdAt: new Date().toISOString(),
-      },
-      ...items,
-    ].slice(0, 20));
-  }
-
-  function scrollTo(ref) {
-    setActiveView("workspace");
-    window.setTimeout(() => ref.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
-  }
-
-  function showToast(message, type = "info") {
-    setToast({ message, type });
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => setToast(""), 2400);
-  }
-
-  return (
-    <AppShell toast={toast}>
-      <div className="relative flex min-h-screen">
-        <SideRail
-          activeView={activeView}
-          onBrief={() => scrollTo(briefRef)}
-          onProfile={() => setActiveView("profile")}
-          onRoadmap={() => scrollTo(roadmapRef)}
-          onSettings={() => setActiveView("settings")}
-          onTasks={() => scrollTo(tasksRef)}
-          onWorkspace={() => setActiveView("workspace")}
-        />
-
-        <section className="flex min-w-0 flex-1 flex-col">
-          <TopBar
-            currentUser={currentUser}
-            health={health}
-            notifications={notifications}
-            onClearNotifications={clearNotifications}
-            onLogout={logout}
-            onMarkRead={markNotificationsRead}
-            onProfile={() => setActiveView("profile")}
-            onRefreshHealth={checkHealth}
-            onSettings={() => setActiveView("settings")}
-            onToggleNotifications={() => setShowNotifications((value) => !value)}
-            showNotifications={showNotifications}
-            unreadCount={unreadCount}
-          />
-
-          {activeView === "profile" ? (
-            <ProfilePage currentUser={currentUser} history={history} onSave={updateProfile} onWorkspace={() => setActiveView("workspace")} />
-          ) : null}
-
-          {activeView === "settings" ? (
-            <SettingsPage
-              health={health}
-              onRefreshHealth={checkHealth}
-              onSave={updateSettings}
-              onWorkspace={() => setActiveView("workspace")}
-              settings={settings}
-            />
-          ) : null}
-
-          {activeView === "workspace" ? (
-            <div className={`grid flex-1 grid-cols-1 border-t border-white/10 ${settings.compactMode ? "lg:grid-cols-[340px_minmax(0,1fr)]" : "lg:grid-cols-[390px_minmax(0,1fr)]"}`}>
-              <aside className="border-r border-white/10 bg-[#111832]/78 px-5 py-6 backdrop-blur-xl" ref={briefRef}>
-                <BrandCard currentUser={currentUser} />
-                <AssignmentForm
-                  assignment={assignment}
-                  error={error}
-                  isLoading={isLoading}
-                  onAnalyze={analyzeAssignment}
-                  onChange={setAssignment}
-                  onClear={clearWorkspace}
-                  onToast={showToast}
-                  onUseSample={useSample}
-                  wordCount={wordCount}
-                />
-                <HistoryPanel history={history} onClear={clearHistory} onLoad={loadHistoryItem} />
-              </aside>
-
-              <ResultsWorkspace
-                breakdown={breakdown}
-                isLoading={isLoading}
-                onCopy={showToast}
-                onRetry={analyzeAssignment}
-                roadmapRef={roadmapRef}
-                tasksRef={tasksRef}
-                workspaceRef={workspaceRef}
-              />
-            </div>
-          ) : null}
-        </section>
-      </div>
-    </AppShell>
-  );
-}
-
-function AppShell({ children, toast }) {
-  return (
-    <main className="min-h-screen overflow-hidden bg-[#08142e] text-slate-100">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(68,84,170,0.34),transparent_30%),linear-gradient(145deg,#08142e_0%,#121735_48%,#08142e_100%)]" />
-      <div
-        className="absolute inset-0 opacity-[0.06]"
-        style={{ backgroundImage: `url(${referenceImage})`, backgroundSize: "cover", backgroundPosition: "center" }}
-      />
-      {children}
-      {toast ? (
-        <div className={`fixed bottom-5 right-5 z-50 rounded-lg border px-4 py-3 text-sm shadow-glow ${
-          toast.type === "error" ? "border-rose-300/30 bg-rose-500/15 text-rose-50" : "border-cyan-300/30 bg-[#151d3c] text-cyan-50"
-        }`}>
-          {toast.message}
-        </div>
-      ) : null}
-    </main>
-  );
-}
-
-function AuthScreen({ onLogin, onSignup, toast }) {
-  const [mode, setMode] = useState("login");
-  const [form, setForm] = useState({ name: "", email: "", password: "" });
-
-  function updateField(field, value) {
-    setForm((state) => ({ ...state, [field]: value }));
-  }
-
-  function submit(event) {
-    event.preventDefault();
-    if (mode === "signup") {
-      onSignup(form);
-    } else {
-      onLogin(form);
+  /* ---------- profile + settings ---------- */
+  async function saveProfile(form) {
+    try {
+      const data = await apiRequest("/api/profile", { method: "PUT", token, body: JSON.stringify(form) });
+      setSession((current) => ({ ...current, user: data.user }));
+      showToast("Profile saved");
+    } catch (requestError) {
+      showToast(requestError.message, "error");
     }
   }
 
-  return (
-    <div className="relative grid min-h-screen place-items-center px-5 py-10">
-      <section className="grid w-full max-w-5xl overflow-hidden rounded-lg border border-white/12 bg-[#111832]/90 shadow-glow backdrop-blur-xl lg:grid-cols-[1fr_430px]">
-        <div className="hidden min-h-[560px] flex-col justify-between border-r border-white/10 bg-gradient-to-br from-cyan-400/16 via-blue-500/8 to-violet-500/18 p-8 lg:flex">
-          <div>
-            <img className="mb-6 size-20 rounded-2xl object-cover shadow-glow" src={logo} alt="Unpack.ai logo" />
-            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-100/80">Student workspace</p>
-            <h1 className="mt-4 max-w-xl text-4xl font-bold leading-tight text-white">Break down assignments before they break your week.</h1>
-          </div>
-          <div className="grid gap-3 text-sm text-slate-200">
-            <AuthFeature icon={BrainCircuit} text="AI assignment analysis with Gemini" />
-            <AuthFeature icon={History} text="Saved analysis history in this browser" />
-            <AuthFeature icon={Shield} text="Private API keys stay on the backend" />
-          </div>
-        </div>
+  async function saveSettings(form) {
+    try {
+      const data = await apiRequest("/api/settings", { method: "PUT", token, body: JSON.stringify(form) });
+      setSettings({ ...defaultSettings, ...data.settings });
+      showToast("Settings saved");
+    } catch (requestError) {
+      showToast(requestError.message, "error");
+    }
+  }
 
-        <form className="p-6 sm:p-8" onSubmit={submit}>
-          <div className="mb-8 flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/80">Unpack.ai</p>
-              <h2 className="mt-2 text-2xl font-bold text-white">{mode === "login" ? "Welcome back" : "Create account"}</h2>
-            </div>
-            <div className="rounded-lg border border-white/10 bg-white/5 p-1">
-              <button className={`rounded-md px-3 py-2 text-sm ${mode === "login" ? "bg-cyan-400/20 text-cyan-50" : "text-slate-400"}`} onClick={() => setMode("login")} type="button">
-                Login
-              </button>
-              <button className={`rounded-md px-3 py-2 text-sm ${mode === "signup" ? "bg-cyan-400/20 text-cyan-50" : "text-slate-400"}`} onClick={() => setMode("signup")} type="button">
-                Sign up
-              </button>
-            </div>
-          </div>
+  /* ---------- notifications ---------- */
+  function toggleNotifications() {
+    setShowNotifications((open) => !open);
+    setNotifications((items) => items.map((item) => ({ ...item, read: true })));
+  }
 
-          <div className="space-y-4">
-            {mode === "signup" ? <TextField label="Full name" onChange={(value) => updateField("name", value)} value={form.name} /> : null}
-            <TextField label="Email" onChange={(value) => updateField("email", value)} type="email" value={form.email} />
-            <TextField label="Password" onChange={(value) => updateField("password", value)} type="password" value={form.password} />
-          </div>
-
-          <button className="mt-6 inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-cyan-400 px-5 text-sm font-bold text-white shadow-violet transition hover:brightness-110" type="submit">
-            {mode === "login" ? "Login" : "Create account"}
-          </button>
-
-          <p className="mt-5 text-sm leading-6 text-slate-400">
-            This demo account system is stored locally in your browser. Use it for the project interface; add a real database before production deployment.
-          </p>
-        </form>
-      </section>
-      {toast ? (
-        <div className={`fixed bottom-5 right-5 z-50 rounded-lg border px-4 py-3 text-sm shadow-glow ${
-          toast.type === "error" ? "border-rose-300/30 bg-rose-500/15 text-rose-50" : "border-cyan-300/30 bg-[#151d3c] text-cyan-50"
-        }`}>
-          {toast.message}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function AuthFeature({ icon: Icon, text }) {
-  return (
-    <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 p-3">
-      <Icon className="text-cyan-200" size={18} />
-      <span>{text}</span>
-    </div>
-  );
-}
-
-function SideRail({ activeView, onBrief, onProfile, onRoadmap, onSettings, onTasks, onWorkspace }) {
-  const items = [
-    { icon: PanelLeft, label: "Workspace", onClick: onWorkspace, active: activeView === "workspace" },
-    { icon: FileText, label: "Brief", onClick: onBrief, active: false },
-    { icon: ClipboardList, label: "Tasks", onClick: onTasks, active: false },
-    { icon: Map, label: "Roadmap", onClick: onRoadmap, active: false },
-    { icon: User, label: "Profile", onClick: onProfile, active: activeView === "profile" },
-    { icon: Settings, label: "Settings", onClick: onSettings, active: activeView === "settings" },
-  ];
-
-  return (
-    <nav className="hidden w-16 shrink-0 border-r border-white/10 bg-[#0b1230]/88 px-3 py-5 backdrop-blur-xl sm:block">
-      <button
-        className="mb-8 grid size-10 place-items-center rounded-lg border border-cyan-300/35 bg-cyan-400/10 text-cyan-200 shadow-glow"
-        onClick={onWorkspace}
-        title="Go to workspace"
-        type="button"
-      >
-        <GraduationCap size={22} />
-      </button>
-      <div className="space-y-3">
-        {items.map((item) => (
-          <button
-            key={item.label}
-            className={`grid size-10 place-items-center rounded-lg border transition ${
-              item.active
-                ? "border-cyan-300/35 bg-cyan-400/14 text-cyan-100"
-                : "border-transparent text-slate-400 hover:border-white/10 hover:bg-white/7 hover:text-white"
-            }`}
-            onClick={item.onClick}
-            title={item.label}
-            type="button"
-          >
-            <item.icon size={20} />
-          </button>
-        ))}
+  /* ---------- render ---------- */
+  if (booting) {
+    return (
+      <div className="splash" role="status">
+        <Loader2 className="spin" size={24} aria-label="Loading" />
       </div>
-    </nav>
+    );
+  }
+
+  if (!user) {
+    return (
+      <>
+        <AuthScreen
+          onGoogle={handleGoogle}
+          onLogin={handleLogin}
+          onPhoneStart={handlePhoneStart}
+          onPhoneVerify={handlePhoneVerify}
+          onSignup={handleSignup}
+        />
+        <Toast toast={toast} />
+      </>
+    );
+  }
+
+  return (
+    <div className={`app${settings.compactMode ? " is-compact" : ""}`}>
+      <Header
+        health={health}
+        notifications={notifications}
+        onClearNotifications={() => setNotifications([])}
+        onCloseNotifications={() => setShowNotifications(false)}
+        onNavigate={setView}
+        onRefreshHealth={checkHealth}
+        onToggleNotifications={toggleNotifications}
+        showNotifications={showNotifications}
+        unreadCount={unreadCount}
+        user={user}
+        view={view}
+      />
+
+      <main className="page">
+        {view === "workspace" ? (
+          <Workspace
+            assignment={assignment}
+            breakdown={breakdown}
+            error={error}
+            history={history}
+            isLoading={isLoading}
+            onAnalyze={analyze}
+            onChange={setAssignment}
+            onClear={clearWorkspace}
+            onClearHistory={clearHistory}
+            onLoadHistory={loadHistoryItem}
+            onToast={showToast}
+            resultId={resultId}
+            token={token}
+            user={user}
+          />
+        ) : null}
+        {view === "profile" ? <ProfilePage history={history} onLogout={logout} onSave={saveProfile} user={user} /> : null}
+        {view === "settings" ? <SettingsPage health={health} onRefreshHealth={checkHealth} onSave={saveSettings} settings={settings} /> : null}
+      </main>
+
+      <Toast toast={toast} />
+    </div>
   );
 }
 
-function TopBar({
-  currentUser,
+/* =====================================================================
+   Layout
+   ===================================================================== */
+
+function Logo({ size = 40 }) {
+  return (
+    <span className="logo" style={{ width: size, height: size }}>
+      <img alt={brand.name} src={logo} />
+    </span>
+  );
+}
+
+function Header({
   health,
   notifications,
   onClearNotifications,
-  onLogout,
-  onMarkRead,
-  onProfile,
+  onCloseNotifications,
+  onNavigate,
   onRefreshHealth,
-  onSettings,
   onToggleNotifications,
   showNotifications,
   unreadCount,
+  user,
+  view,
 }) {
-  const online = health.state === "online";
+  const offline = health.state === "offline";
 
   return (
-    <header className="relative flex min-h-16 items-center justify-between bg-[#111832]/82 px-5 py-3 backdrop-blur-xl sm:px-7">
-      <div className="flex min-w-0 items-center gap-3">
-        <img className="size-11 rounded-lg object-cover shadow-glow" src={logo} alt="Unpack.ai logo" />
-        <div className="min-w-0">
-          <p className="truncate text-lg font-bold tracking-normal text-white">Unpack.ai</p>
-          <p className="truncate text-xs uppercase tracking-[0.18em] text-cyan-200/75">AI-powered academic assistant</p>
+    <header className="header">
+      <div className="header-inner">
+        <div className="brand">
+          <Logo />
+          <div>
+            <p className="brand-name">{brand.name}</p>
+            <p className="brand-tagline">{brand.tagline}</p>
+          </div>
+        </div>
+
+        <nav aria-label="Main" className="nav">
+          {NAV.map((item) => (
+            <button
+              aria-current={view === item.id ? "page" : undefined}
+              className="nav-link"
+              key={item.id}
+              onClick={() => onNavigate(item.id)}
+              type="button"
+            >
+              {item.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="header-tools">
+          <button
+            className={`status status-${health.state}`}
+            onClick={onRefreshHealth}
+            title={offline ? "Server unreachable. Select to retry." : health.state === "checking" ? "Connecting" : "Connected"}
+            type="button"
+          >
+            <span aria-hidden="true" className="status-dot" />
+            <span className={offline ? "" : "sr-only"}>
+              {offline ? "Server offline, retry" : health.state === "checking" ? "Connecting" : "Connected"}
+            </span>
+          </button>
+
+          <div className="popover-anchor">
+            <button
+              aria-expanded={showNotifications}
+              aria-label="Notifications"
+              className="icon-btn"
+              onClick={onToggleNotifications}
+              type="button"
+            >
+              <Bell size={18} />
+              {unreadCount ? <span className="badge">{unreadCount}</span> : null}
+            </button>
+            {showNotifications ? (
+              <NotificationsPanel items={notifications} onClear={onClearNotifications} onClose={onCloseNotifications} />
+            ) : null}
+          </div>
+
+          <button aria-label="Open profile" className="avatar-btn" onClick={() => onNavigate("profile")} type="button">
+            <Avatar name={user.name} size={32} />
+            <span className="avatar-name">{user.name}</span>
+          </button>
         </div>
       </div>
-
-      <div className="flex items-center gap-2 sm:gap-3">
-        <button
-          className={`hidden items-center gap-2 rounded-lg border px-3 py-2 text-xs sm:inline-flex ${
-            online ? "border-emerald-300/25 bg-emerald-400/10 text-emerald-100" : "border-rose-300/25 bg-rose-400/10 text-rose-100"
-          }`}
-          onClick={onRefreshHealth}
-          type="button"
-        >
-          {online ? <Wifi size={16} /> : <WifiOff size={16} />}
-          {health.label}
-        </button>
-        <button className="grid size-10 place-items-center rounded-lg border border-white/10 bg-white/5 text-slate-300 transition hover:bg-white/10" onClick={onSettings} title="Settings" type="button">
-          <Settings size={18} />
-        </button>
-        <button
-          className="relative grid size-10 place-items-center rounded-lg border border-white/10 bg-white/5 text-slate-300 transition hover:bg-white/10"
-          onClick={() => {
-            onToggleNotifications();
-            onMarkRead();
-          }}
-          title="Notifications"
-          type="button"
-        >
-          <Bell size={18} />
-          {unreadCount ? <span className="absolute -right-1 -top-1 grid min-w-5 place-items-center rounded-full bg-cyan-300 px-1 text-[11px] font-bold text-[#08142e]">{unreadCount}</span> : null}
-        </button>
-        <button className="flex h-10 items-center gap-2 rounded-full border border-white/15 bg-white/5 pl-2 pr-3 text-sm text-white" onClick={onProfile} type="button">
-          <Avatar name={currentUser.name} small />
-          <span className="hidden max-w-28 truncate sm:inline">{currentUser.name}</span>
-        </button>
-      </div>
-
-      {showNotifications ? (
-        <NotificationsPanel
-          health={health}
-          notifications={notifications}
-          onClear={onClearNotifications}
-          onClose={onToggleNotifications}
-          onLogout={onLogout}
-          onRefreshHealth={onRefreshHealth}
-        />
-      ) : null}
     </header>
   );
 }
 
-function NotificationsPanel({ health, notifications, onClear, onClose, onLogout, onRefreshHealth }) {
-  const data = health.data || {};
-  const online = health.state === "online";
-
+function NotificationsPanel({ items, onClear, onClose }) {
   return (
-    <div className="absolute right-4 top-16 z-40 w-[min(420px,calc(100vw-32px))] rounded-lg border border-white/12 bg-[#151d3c] p-4 shadow-glow">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <p className="text-base font-bold text-white">Notifications</p>
-          <p className="text-xs text-slate-400">System updates and recent workspace activity</p>
-        </div>
-        <button className="rounded-lg border border-white/10 bg-white/5 p-2 text-slate-200" onClick={onClose} type="button">
+    <div className="popover" role="dialog" aria-label="Notifications">
+      <div className="popover-head">
+        <h2>Notifications</h2>
+        <button aria-label="Close notifications" className="icon-btn icon-btn-sm" onClick={onClose} type="button">
           <X size={16} />
         </button>
       </div>
-
-      <div className={`mb-4 rounded-lg border p-3 ${online ? "border-emerald-300/25 bg-emerald-400/10" : "border-rose-300/25 bg-rose-400/10"}`}>
-        <div className="mb-2 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-sm font-semibold text-white">
-            {online ? <Wifi size={16} /> : <WifiOff size={16} />}
-            {health.label}
-          </div>
-          <button className="text-xs text-slate-200 hover:text-white" onClick={onRefreshHealth} type="button">
-            Refresh
-          </button>
-        </div>
-        <div className="grid gap-1 text-xs text-slate-300">
-          <span>Gemini: {data.hasGeminiKey ? data.geminiModel : "not configured"}</span>
-          <span>OpenAI: {data.hasOpenAIKey ? data.openAIModel : "not configured"}</span>
-          <span>Hugging Face: {data.hasHuggingFaceToken ? data.huggingFaceModel : "not configured"}</span>
-        </div>
-      </div>
-
-      <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
-        {notifications.length ? (
-          notifications.map((item) => (
-            <article className={`rounded-lg border p-3 ${item.type === "error" ? "border-rose-300/25 bg-rose-500/10" : "border-white/10 bg-white/5"}`} key={item.id}>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-white">{item.title}</h3>
-                  <p className="mt-1 text-sm leading-5 text-slate-300">{item.message}</p>
-                </div>
-                {!item.read ? <span className="mt-1 size-2 shrink-0 rounded-full bg-cyan-300" /> : null}
-              </div>
-              <p className="mt-2 text-xs text-slate-500">{new Date(item.createdAt).toLocaleString()}</p>
-            </article>
-          ))
-        ) : (
-          <p className="rounded-lg border border-white/10 bg-white/5 p-4 text-sm text-slate-400">No notifications yet.</p>
-        )}
-      </div>
-
-      <div className="mt-4 flex justify-between gap-3">
-        <button className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200" onClick={onClear} type="button">
+      {items.length ? (
+        <ul className="notice-list">
+          {items.map((item) => (
+            <li className={`notice${item.type === "error" ? " is-error" : ""}`} key={item.id}>
+              <p className="notice-title">{item.title}</p>
+              <p className="notice-text">{item.message}</p>
+              <p className="notice-time">{formatDate(item.createdAt)}</p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="hint">Nothing new.</p>
+      )}
+      {items.length ? (
+        <button className="btn btn-quiet btn-sm" onClick={onClear} type="button">
           Clear all
         </button>
-        <button className="inline-flex items-center gap-2 rounded-lg border border-rose-300/20 bg-rose-500/10 px-3 py-2 text-sm text-rose-100" onClick={onLogout} type="button">
-          <LogOut size={16} />
-          Sign out
-        </button>
-      </div>
+      ) : null}
     </div>
   );
 }
 
-function BrandCard({ currentUser }) {
+function Avatar({ name, size = 40 }) {
   return (
-    <section className="mb-6 rounded-lg border border-cyan-300/40 bg-gradient-to-br from-cyan-400/18 via-blue-500/12 to-violet-500/18 p-5 shadow-glow">
-      <div className="mb-4 flex items-center justify-between gap-4">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-100/80">Main Topic</p>
-          <h1 className="mt-2 text-2xl font-bold leading-tight text-white">Welcome, {currentUser.name.split(" ")[0]}</h1>
-        </div>
-        <BrainCircuit className="shrink-0 text-cyan-100/80" size={42} />
-      </div>
-      <p className="text-sm leading-6 text-slate-200/86">Paste or upload a brief and Unpack.ai will extract the academic target, tasks, structure, and roadmap.</p>
-    </section>
+    <span
+      aria-hidden="true"
+      className="avatar"
+      style={{ width: size, height: size, fontSize: size * 0.38, background: `hsl(${nameToHue(name)} 42% 36%)` }}
+    >
+      {initials(name)}
+    </span>
   );
 }
 
-function AssignmentForm({ assignment, error, isLoading, onAnalyze, onChange, onClear, onToast, onUseSample, wordCount }) {
-  async function handleFileUpload(event) {
-    const file = event.target.files?.[0];
-    event.target.value = "";
+function Toast({ toast }) {
+  return (
+    <div aria-live="polite" className="toast-region" role="status">
+      {toast ? <div className={`toast${toast.type === "error" ? " is-error" : ""}`}>{toast.message}</div> : null}
+    </div>
+  );
+}
 
-    if (!file) return;
+/* =====================================================================
+   Sign in
+   ===================================================================== */
 
-    if (!/\.(txt|md)$/i.test(file.name)) {
-      onToast("Upload a .txt or .md file", "error");
-      return;
+function AuthScreen({ onGoogle, onLogin, onPhoneStart, onPhoneVerify, onSignup }) {
+  const [mode, setMode] = useState("login");
+  const [form, setForm] = useState({ name: "", email: "", password: "", phone: "", code: "" });
+  const [phoneStage, setPhoneStage] = useState("number");
+  const [busy, setBusy] = useState(false);
+
+  const setField = (field) => (event) => setForm((state) => ({ ...state, [field]: event.target.value }));
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    await (mode === "signup" ? onSignup(form) : onLogin(form));
+    setBusy(false);
+  }
+
+  async function submitPhone() {
+    setBusy(true);
+    if (phoneStage === "number") {
+      if (await onPhoneStart(form.phone)) setPhoneStage("code");
+    } else {
+      await onPhoneVerify(form.phone, form.code);
     }
-
-    const text = await file.text();
-    onChange(text.slice(0, 12000));
-    onToast("Brief uploaded");
+    setBusy(false);
   }
 
   return (
-    <form className="space-y-5" onSubmit={onAnalyze}>
-      <div>
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <label className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-300" htmlFor="assignment">Assignment Text</label>
-          <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">{wordCount} words</span>
+    <div className="auth">
+      <section className="auth-intro">
+        <Logo size={56} />
+        <h1>{copy.auth.headline}</h1>
+        <p>{copy.auth.subline}</p>
+      </section>
+
+      <section className="auth-panel">
+        <div aria-label="Account" className="segmented" role="tablist">
+          <button aria-selected={mode === "login"} onClick={() => setMode("login")} role="tab" type="button">
+            Log in
+          </button>
+          <button aria-selected={mode === "signup"} onClick={() => setMode("signup")} role="tab" type="button">
+            Sign up
+          </button>
         </div>
-        <textarea
-          className="min-h-64 w-full resize-y rounded-lg border border-white/12 bg-[#0c1430]/88 p-4 text-sm leading-6 text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-300/80 focus:shadow-glow"
-          id="assignment"
-          maxLength={12000}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="Paste your assignment question or brief here..."
-          value={assignment}
+
+        <form className="stack" onSubmit={submit}>
+          {mode === "signup" ? <Field autoComplete="name" label="Full name" onChange={setField("name")} value={form.name} /> : null}
+          <Field autoComplete="email" label="Email" onChange={setField("email")} type="email" value={form.email} />
+          <Field
+            autoComplete={mode === "signup" ? "new-password" : "current-password"}
+            label="Password"
+            onChange={setField("password")}
+            type="password"
+            value={form.password}
+          />
+          <button className="btn btn-primary btn-block" disabled={busy} type="submit">
+            {busy ? <Loader2 className="spin" size={16} /> : null}
+            {mode === "login" ? "Log in" : "Create account"}
+          </button>
+        </form>
+
+        {features.googleLogin || features.phoneLogin ? <p className="divider">or</p> : null}
+
+        <div className="stack">
+          {features.googleLogin ? (
+            <button className="btn btn-outline btn-block" onClick={onGoogle} type="button">
+              Continue with Google
+            </button>
+          ) : null}
+
+          {features.phoneLogin ? (
+            <details className="disclosure">
+              <summary>Use a phone number</summary>
+              <div className="stack">
+                <div className="row">
+                  <input
+                    aria-label="Phone number"
+                    autoComplete="tel"
+                    className="input"
+                    onChange={setField("phone")}
+                    placeholder={copy.auth.phonePlaceholder}
+                    type="tel"
+                    value={form.phone}
+                  />
+                  <button className="btn btn-outline" disabled={busy || !form.phone.trim()} onClick={submitPhone} type="button">
+                    <Phone size={16} />
+                    {phoneStage === "number" ? "Send code" : "Verify"}
+                  </button>
+                </div>
+                {phoneStage === "code" ? (
+                  <input
+                    aria-label="Verification code"
+                    autoComplete="one-time-code"
+                    className="input"
+                    inputMode="numeric"
+                    onChange={setField("code")}
+                    placeholder="Code from your SMS"
+                    value={form.code}
+                  />
+                ) : null}
+              </div>
+            </details>
+          ) : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/* =====================================================================
+   Workspace
+   ===================================================================== */
+
+function Workspace({
+  assignment,
+  breakdown,
+  error,
+  history,
+  isLoading,
+  onAnalyze,
+  onChange,
+  onClear,
+  onClearHistory,
+  onLoadHistory,
+  onToast,
+  resultId,
+  token,
+  user,
+}) {
+  return (
+    <div className="workspace">
+      <aside className="brief">
+        <BriefForm
+          assignment={assignment}
+          error={error}
+          isLoading={isLoading}
+          onAnalyze={onAnalyze}
+          onChange={onChange}
+          onClear={onClear}
+          onToast={onToast}
+          token={token}
+          user={user}
         />
+        <History history={history} onClear={onClearHistory} onLoad={onLoadHistory} />
+      </aside>
+
+      <section aria-live="polite" className="result">
+        {isLoading ? <Working /> : breakdown ? <Breakdown breakdown={breakdown} key={resultId} onRetry={onAnalyze} onToast={onToast} /> : <EmptyState />}
+      </section>
+    </div>
+  );
+}
+
+function BriefForm({ assignment, error, isLoading, onAnalyze, onChange, onClear, onToast, token, user }) {
+  const [linkUrl, setLinkUrl] = useState("");
+  const [isImporting, setIsImporting] = useState(false);
+  const words = countWords(assignment);
+  const firstName = (user.name || "").split(" ")[0];
+
+  async function handleFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (!hasAllowedExtension(file.name, documents.extensions)) {
+      onToast(copy.errors.fileType(documents.extensions), "error");
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const body = new FormData();
+      body.append("document", file);
+      const data = await apiRequest("/api/documents/extract", { method: "POST", token, body });
+      onChange(data.text || "");
+      onToast(`${data.name || file.name} imported`);
+    } catch (requestError) {
+      onToast(requestError.message || copy.errors.readDocument, "error");
+    } finally {
+      setIsImporting(false);
+    }
+  }
+
+  async function importLink() {
+    if (!linkUrl.trim()) {
+      onToast("Paste a public document link first", "error");
+      return;
+    }
+    setIsImporting(true);
+    try {
+      const data = await apiRequest("/api/documents/import-url", { method: "POST", token, body: JSON.stringify({ url: linkUrl.trim() }) });
+      onChange(data.text || "");
+      setLinkUrl("");
+      onToast(`${data.name || "Document"} imported`);
+    } catch (requestError) {
+      onToast(requestError.message || copy.errors.readDocument, "error");
+    } finally {
+      setIsImporting(false);
+    }
+  }
+
+  return (
+    <form className="brief-form" onSubmit={onAnalyze}>
+      <p className="greeting">{copy.workspace.greeting(firstName)}</p>
+
+      <div className="label-row">
+        <label htmlFor="assignment">{copy.workspace.briefLabel}</label>
+        <span className="count">{words} words</span>
       </div>
+      <textarea
+        className="textarea"
+        id="assignment"
+        maxLength={limits.maxBriefChars}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") onAnalyze(event);
+        }}
+        placeholder={copy.workspace.briefPlaceholder}
+        rows={12}
+        value={assignment}
+      />
 
       {error ? (
-        <div className="flex gap-3 rounded-lg border border-rose-300/30 bg-rose-500/10 p-3 text-sm text-rose-100">
-          <AlertCircle className="mt-0.5 shrink-0" size={18} />
-          <p>{error}</p>
-        </div>
+        <p className="form-error" role="alert">
+          {error}
+        </p>
       ) : null}
 
-      <div className="grid grid-cols-[1fr_auto_auto_auto] gap-3">
-        <button className="inline-flex h-12 items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-cyan-400 px-5 text-sm font-bold text-white shadow-violet transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-65" disabled={isLoading} type="submit">
-          {isLoading ? <Loader2 className="animate-spin" size={18} /> : <Send size={18} />}
-          Analyze
+      <div className="actions">
+        <button className="btn btn-primary" disabled={isLoading || isImporting} type="submit">
+          {isLoading ? <Loader2 className="spin" size={16} /> : null}
+          {copy.workspace.analyze}
         </button>
-        <IconButton icon={Sparkles} label="Load sample" onClick={onUseSample} />
-        <label className="grid h-12 w-12 cursor-pointer place-items-center rounded-lg border border-white/12 bg-white/6 text-cyan-100 transition hover:bg-white/10" title="Upload .txt or .md">
-          <Upload size={18} />
-          <input accept=".txt,.md,text/plain,text/markdown" className="hidden" onChange={handleFileUpload} type="file" />
+        <label className="btn btn-outline">
+          {isImporting ? <Loader2 className="spin" size={16} /> : <FileUp size={16} />}
+          Upload file
+          <input accept={acceptAttribute(documents.extensions)} className="sr-only" onChange={handleFile} type="file" />
         </label>
-        <IconButton icon={Trash2} label="Clear workspace" onClick={onClear} />
+        {sampleBrief ? (
+          <button className="btn btn-quiet" onClick={() => onChange(sampleBrief)} type="button">
+            Try an example
+          </button>
+        ) : null}
+        <button aria-label="Clear brief and results" className="icon-btn" onClick={onClear} title="Clear" type="button">
+          <Trash2 size={18} />
+        </button>
       </div>
+
+      <details className="disclosure">
+        <summary>
+          <Link2 size={15} />
+          Import from a link
+        </summary>
+        <div className="row">
+          <input
+            aria-label="Document link"
+            className="input"
+            onChange={(event) => setLinkUrl(event.target.value)}
+            placeholder="Public Google Drive, OneDrive or PDF link"
+            type="url"
+            value={linkUrl}
+          />
+          <button className="btn btn-outline" disabled={isImporting} onClick={importLink} type="button">
+            Import
+          </button>
+        </div>
+      </details>
     </form>
   );
 }
 
-function HistoryPanel({ history, onClear, onLoad }) {
+function History({ history, onClear, onLoad }) {
   return (
-    <section className="mt-6 rounded-lg border border-white/10 bg-[#151d3c]/70 p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <History className="text-cyan-200" size={18} />
-          <h2 className="text-sm font-semibold uppercase tracking-[0.14em] text-slate-200">History</h2>
-        </div>
-        <button className="text-xs text-slate-400 hover:text-white" onClick={onClear} type="button">Clear</button>
-      </div>
-      <div className="space-y-2">
+    <section className="history">
+      <div className="label-row">
+        <h2>{copy.history.title}</h2>
         {history.length ? (
-          history.map((item) => (
-            <button className="w-full rounded-lg border border-white/8 bg-white/5 px-3 py-3 text-left text-sm transition hover:border-cyan-300/30 hover:bg-cyan-400/8" key={item.id} onClick={() => onLoad(item)} type="button">
-              <p className="line-clamp-2 font-medium text-slate-100">{item.breakdown.mainTopic || item.assignment}</p>
-              <p className="mt-1 text-xs text-slate-400">{new Date(item.createdAt).toLocaleString()}</p>
-            </button>
-          ))
-        ) : (
-          <p className="text-sm text-slate-400">No saved analyses yet.</p>
-        )}
+          <button className="link-btn" onClick={onClear} type="button">
+            Clear
+          </button>
+        ) : null}
       </div>
+      {history.length ? (
+        <ul className="history-list">
+          {history.map((item) => (
+            <li key={item.id}>
+              <button className="history-item" onClick={() => onLoad(item)} type="button">
+                <span className="history-title">{item.breakdown?.mainTopic || item.assignment}</span>
+                <span className="history-time">{formatDate(item.createdAt)}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="hint">{copy.history.empty}</p>
+      )}
     </section>
   );
 }
 
-function ResultsWorkspace({ breakdown, isLoading, onCopy, onRetry, roadmapRef, tasksRef, workspaceRef }) {
-  const data = breakdown || {
-    mainTopic: "Ready to unpack your assignment",
-    keyConcepts: ["Academic focus", "Research direction", "Student planning"],
-    keywords: ["Main topic", "Keywords", "Tasks", "Roadmap"],
-    requiredTasks: ["Paste an assignment brief", "Click Analyze", "Review the structured guide"],
-    suggestedStructure: ["Introduction", "Body sections", "Conclusion", "References"],
-    completionPlan: ["Understand the question", "Plan research", "Draft and refine"],
-    summary: "Your structured breakdown will appear here after analysis.",
-  };
-
+function EmptyState() {
   return (
-    <section className="relative min-w-0 bg-[#101733]/68 p-5 backdrop-blur-xl sm:p-7" ref={workspaceRef}>
-      {isLoading ? <LoadingOverlay /> : null}
-      <ResultActions breakdown={breakdown} onCopy={onCopy} onRetry={onRetry} />
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="space-y-5">
-          <TopicPanel provider={breakdown?.provider} summary={data.summary} topic={data.mainTopic} />
-          <ChipPanel title="Key Concepts" icon={BookOpenCheck} items={data.keyConcepts} />
-          <ChipPanel title="Key Keywords" icon={Search} items={data.keywords} gradient />
-          <div ref={tasksRef}>
-            <TaskPanel items={data.requiredTasks} />
-          </div>
-        </div>
-        <div className="space-y-5" ref={roadmapRef}>
-          <RoadmapPanel items={data.completionPlan} />
-          <StructurePanel items={data.suggestedStructure} />
-        </div>
-      </div>
-    </section>
+    <div className="empty">
+      <h1>{copy.empty.title}</h1>
+      <p className="lede">{copy.empty.text}</p>
+      <ol className="steps">
+        {copy.empty.steps.map((step) => (
+          <li key={step}>{step}</li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
-function ResultActions({ breakdown, onCopy, onRetry }) {
-  const disabled = !breakdown;
-
-  async function copyMarkdown() {
-    if (!breakdown) {
-      onCopy("Analyze a brief first");
-      return;
-    }
-    await navigator.clipboard.writeText(createMarkdown(breakdown));
-    onCopy("Result copied");
-  }
-
-  function downloadMarkdown() {
-    if (!breakdown) {
-      onCopy("Analyze a brief first");
-      return;
-    }
-    const blob = new Blob([createMarkdown(breakdown)], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "unpack-ai-breakdown.md";
-    anchor.click();
-    URL.revokeObjectURL(url);
-    onCopy("Markdown downloaded");
-  }
-
+function Working() {
   return (
-    <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/10 bg-[#151d3c]/70 p-3">
-      <p className="text-sm text-slate-300">Export, copy, or retry your latest breakdown.</p>
-      <div className="flex flex-wrap gap-2">
-        <ActionButton disabled={disabled} icon={Copy} label="Copy" onClick={copyMarkdown} />
-        <ActionButton disabled={disabled} icon={Download} label="Download" onClick={downloadMarkdown} />
-        <ActionButton icon={RotateCcw} label="Retry" onClick={onRetry} />
+    <div className="empty" role="status">
+      <h1>{copy.working.title}</h1>
+      <p className="lede">{copy.working.text}</p>
+      <div aria-hidden="true" className="skeleton">
+        <span />
+        <span />
+        <span />
       </div>
     </div>
   );
 }
 
-function ProfilePage({ currentUser, history, onSave, onWorkspace }) {
-  const [form, setForm] = useState(currentUser);
+/* =====================================================================
+   Breakdown
+   ===================================================================== */
+
+function Breakdown({ breakdown, onRetry, onToast }) {
+  const { sections } = copy;
+
+  async function copyMarkdown() {
+    try {
+      await navigator.clipboard.writeText(createMarkdown(breakdown));
+      onToast("Copied to clipboard");
+    } catch {
+      onToast("Copying isn't allowed in this browser", "error");
+    }
+  }
+
+  function downloadMarkdown() {
+    const blob = new Blob([createMarkdown(breakdown)], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${slugify(breakdown.mainTopic) || slugify(brand.name) || "breakdown"}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const concepts = asArray(breakdown.keyConcepts);
+  const keywords = asArray(breakdown.keywords);
+  const tasks = asArray(breakdown.requiredTasks);
+  const structure = asArray(breakdown.suggestedStructure);
+  const plan = asArray(breakdown.completionPlan);
 
   return (
-    <PageShell title="Profile" subtitle="Manage your student details and workspace identity" onBack={onWorkspace}>
-      <div className="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
-        <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-          <Avatar name={currentUser.name} large />
-          <h2 className="mt-4 text-2xl font-bold text-white">{currentUser.name}</h2>
-          <p className="mt-1 text-sm text-slate-400">{currentUser.email}</p>
-          <div className="mt-5 grid gap-3 text-sm">
-            <ProfileStat label="Saved analyses" value={history.length} />
-            <ProfileStat label="Institution" value={currentUser.institution || "Not set"} />
-            <ProfileStat label="Course" value={currentUser.course || "Not set"} />
-          </div>
+    <article className="doc">
+      <header className="doc-head">
+        <h1>
+          <span className="mark sweep">{breakdown.mainTopic || "Untitled assignment"}</span>
+        </h1>
+        <div className="doc-actions">
+          <button className="btn btn-outline btn-sm" onClick={copyMarkdown} type="button">
+            <Copy size={15} />
+            Copy
+          </button>
+          <button className="btn btn-outline btn-sm" onClick={downloadMarkdown} type="button">
+            <Download size={15} />
+            Download
+          </button>
+          <button className="btn btn-quiet btn-sm" onClick={onRetry} type="button">
+            <RotateCcw size={15} />
+            Run again
+          </button>
+        </div>
+      </header>
+
+      {breakdown.provider === "local" ? (
+        <aside className="notice-bar" role="note">
+          <strong>{copy.local.title}</strong>
+          <span>{copy.local.text}</span>
+        </aside>
+      ) : null}
+
+      {breakdown.summary ? <p className="lede">{breakdown.summary}</p> : null}
+
+      {concepts.length ? (
+        <section className="doc-section">
+          <h2>{sections.concepts}</h2>
+          <ul className="chips">
+            {concepts.map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ul>
         </section>
-        <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <TextField label="Full name" onChange={(value) => setForm((state) => ({ ...state, name: value }))} value={form.name} />
-            <TextField label="Email" onChange={(value) => setForm((state) => ({ ...state, email: value }))} type="email" value={form.email} />
-            <TextField label="Institution" onChange={(value) => setForm((state) => ({ ...state, institution: value }))} value={form.institution || ""} />
-            <TextField label="Course / Module" onChange={(value) => setForm((state) => ({ ...state, course: value }))} value={form.course || ""} />
-          </div>
-          <button className="mt-5 inline-flex h-11 items-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-cyan-400 px-5 text-sm font-bold text-white" onClick={() => onSave(form)} type="button">
-            <Save size={16} />
+      ) : null}
+
+      {keywords.length ? (
+        <section className="doc-section">
+          <h2>{sections.keywords}</h2>
+          <ul className="chips chips-soft">
+            {keywords.map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {tasks.length ? <Checklist items={tasks} title={sections.tasks} /> : null}
+
+      {structure.length ? (
+        <section className="doc-section">
+          <h2>{sections.structure}</h2>
+          <ul className="outline">
+            {structure.map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {plan.length ? (
+        <section className="doc-section">
+          <h2>{sections.plan}</h2>
+          <ol className="steps steps-line">
+            {plan.map((item, index) => (
+              <li key={`${item}-${index}`}>{item}</li>
+            ))}
+          </ol>
+        </section>
+      ) : null}
+    </article>
+  );
+}
+
+function Checklist({ items, title }) {
+  const [done, setDone] = useState({});
+  const finished = items.filter((_, index) => done[index]).length;
+
+  return (
+    <section className="doc-section">
+      <div className="label-row">
+        <h2>{title}</h2>
+        <span className="count">
+          {finished} of {items.length} done
+        </span>
+      </div>
+      <ul className="checklist">
+        {items.map((item, index) => (
+          <li key={`${item}-${index}`}>
+            <label className={done[index] ? "is-done" : ""}>
+              <input checked={Boolean(done[index])} onChange={(event) => setDone((state) => ({ ...state, [index]: event.target.checked }))} type="checkbox" />
+              <span aria-hidden="true" className="box">
+                <Check size={14} strokeWidth={3} />
+              </span>
+              <span className="check-text">{item}</span>
+            </label>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/* =====================================================================
+   Profile + settings
+   ===================================================================== */
+
+function ProfilePage({ history, onLogout, onSave, user }) {
+  const [form, setForm] = useState({
+    name: user.name || "",
+    email: user.email || "",
+    institution: user.institution || "",
+    course: user.course || "",
+  });
+  const setField = (field) => (event) => setForm((state) => ({ ...state, [field]: event.target.value }));
+
+  return (
+    <div className="narrow">
+      <header className="page-head">
+        <Avatar name={user.name} size={64} />
+        <div>
+          <h1>{user.name}</h1>
+          <p className="hint">{user.email}</p>
+        </div>
+      </header>
+
+      <form
+        className="stack stack-lg"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave(form);
+        }}
+      >
+        <div className="grid-2">
+          <Field autoComplete="name" label="Full name" onChange={setField("name")} value={form.name} />
+          <Field autoComplete="email" label="Email" onChange={setField("email")} type="email" value={form.email} />
+          <Field label="Institution" onChange={setField("institution")} value={form.institution} />
+          <Field label="Course or module" onChange={setField("course")} value={form.course} />
+        </div>
+        <div className="actions">
+          <button className="btn btn-primary" type="submit">
             Save profile
           </button>
-        </section>
-      </div>
-    </PageShell>
+          <button className="btn btn-quiet" onClick={onLogout} type="button">
+            <LogOut size={16} />
+            Sign out
+          </button>
+        </div>
+      </form>
+
+      <dl className="facts">
+        <div>
+          <dt>Saved breakdowns</dt>
+          <dd>{history.length}</dd>
+        </div>
+      </dl>
+    </div>
   );
 }
 
-function SettingsPage({ health, onRefreshHealth, onSave, onWorkspace, settings }) {
+function SettingsPage({ health, onRefreshHealth, onSave, settings }) {
   const [form, setForm] = useState(settings);
+  const setValue = (field) => (event) =>
+    setForm((state) => ({ ...state, [field]: event.target.type === "checkbox" ? event.target.checked : event.target.value }));
 
   return (
-    <PageShell title="Settings" subtitle="Tune outputs for your academic context" onBack={onWorkspace}>
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <SelectField label="Academic level" onChange={(value) => setForm((state) => ({ ...state, academicLevel: value }))} options={["College", "University", "Honours", "Masters"]} value={form.academicLevel} />
-            <SelectField label="Referencing style" onChange={(value) => setForm((state) => ({ ...state, referencingStyle: value }))} options={["Harvard", "APA", "MLA", "IEEE", "Chicago"]} value={form.referencingStyle} />
-            <SelectField label="Output language" onChange={(value) => setForm((state) => ({ ...state, language: value }))} options={["English", "Zulu", "Xhosa", "Afrikaans", "Sesotho"]} value={form.language} />
-          </div>
-          <div className="mt-5 grid gap-3">
-            <ToggleField checked={form.saveHistory} label="Save analysis history on this browser" onChange={(value) => setForm((state) => ({ ...state, saveHistory: value }))} />
-            <ToggleField checked={form.compactMode} label="Compact workspace layout" onChange={(value) => setForm((state) => ({ ...state, compactMode: value }))} />
-          </div>
-          <button className="mt-5 inline-flex h-11 items-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-cyan-400 px-5 text-sm font-bold text-white" onClick={() => onSave(form)} type="button">
-            <Save size={16} />
+    <div className="narrow">
+      <header className="page-head">
+        <div>
+          <h1>Settings</h1>
+          <p className="hint">These shape how your briefs are analyzed.</p>
+        </div>
+      </header>
+
+      <form
+        className="stack stack-lg"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave(form);
+        }}
+      >
+        <div className="grid-2">
+          <SelectField label="Academic level" onChange={setValue("academicLevel")} options={options.academicLevels} value={form.academicLevel} />
+          <SelectField label="Referencing style" onChange={setValue("referencingStyle")} options={options.referencingStyles} value={form.referencingStyle} />
+          <SelectField label="Output language" onChange={setValue("language")} options={options.languages} value={form.language} />
+        </div>
+
+        <div className="stack">
+          <Toggle checked={form.saveHistory} label="Keep my recent breakdowns" onChange={setValue("saveHistory")} />
+          <Toggle checked={form.compactMode} label="Use a tighter layout" onChange={setValue("compactMode")} />
+        </div>
+
+        <div className="actions">
+          <button className="btn btn-primary" type="submit">
             Save settings
           </button>
-        </section>
-        <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <h2 className="font-bold text-white">Provider</h2>
-              <p className="text-sm text-slate-400">{health.label}</p>
-            </div>
-            <button className="rounded-lg border border-white/10 bg-white/5 p-2 text-slate-200" onClick={onRefreshHealth} type="button">
-              <RotateCcw size={16} />
+        </div>
+      </form>
+
+      <dl className="facts">
+        <div>
+          <dt>Server</dt>
+          <dd>
+            {health.state === "online" ? "Connected" : health.state === "checking" ? "Connecting" : "Offline"}
+            <button className="link-btn" onClick={onRefreshHealth} type="button">
+              Check again
             </button>
-          </div>
-          <div className="grid gap-2 text-sm">
-            <ProfileStat label="Provider" value={health.data?.provider || "unknown"} />
-            <ProfileStat label="Gemini" value={health.data?.hasGeminiKey ? health.data.geminiModel : "Not configured"} />
-            <ProfileStat label="Backend" value={health.state === "online" ? "Online" : "Offline"} />
-          </div>
-        </section>
-      </div>
-    </PageShell>
-  );
-}
-
-function PageShell({ children, onBack, subtitle, title }) {
-  return (
-    <section className="flex-1 border-t border-white/10 bg-[#101733]/68 p-5 backdrop-blur-xl sm:p-7">
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-3xl font-bold text-white">{title}</h1>
-          <p className="mt-1 text-sm text-slate-400">{subtitle}</p>
+          </dd>
         </div>
-        <button className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-100" onClick={onBack} type="button">
-          Back to workspace
-        </button>
-      </div>
-      {children}
-    </section>
+        {health.provider ? (
+          <div>
+            <dt>Analysis provider</dt>
+            <dd>{health.provider}</dd>
+          </div>
+        ) : null}
+      </dl>
+    </div>
   );
 }
 
-function TopicPanel({ provider, summary, topic }) {
+/* =====================================================================
+   Form fields
+   ===================================================================== */
+
+function Field({ label, onChange, type = "text", value, ...rest }) {
   return (
-    <section className="rounded-lg border border-white/10 bg-[#171f42]/82 p-5 shadow-glow">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200/75">Main Topic</p>
-          <h2 className="mt-2 text-2xl font-bold leading-tight text-white">{topic || "Untitled assignment"}</h2>
-          {provider ? <p className="mt-2 text-xs text-emerald-200">Generated with {provider}</p> : null}
-        </div>
-        <Target className="shrink-0 text-cyan-200" size={32} />
-      </div>
-      <p className="max-w-4xl text-sm leading-7 text-slate-200/86">{summary || "No summary returned yet."}</p>
-    </section>
-  );
-}
-
-function ChipPanel({ title, icon: Icon, items = [], gradient = false }) {
-  return (
-    <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-      <div className="mb-4 flex items-center gap-2 text-slate-200">
-        <Icon size={18} className="text-cyan-200" />
-        <h3 className="text-sm font-semibold uppercase tracking-[0.14em]">{title}</h3>
-      </div>
-      <div className="flex flex-wrap gap-3">
-        {items.length ? (
-          items.map((item) => (
-            <span className={`rounded-full px-4 py-2 text-sm text-white ${gradient ? "bg-gradient-to-r from-violet-500 to-cyan-500 shadow-violet" : "border border-cyan-300/25 bg-cyan-400/10"}`} key={item}>
-              {item}
-            </span>
-          ))
-        ) : (
-          <EmptyText />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function TaskPanel({ items = [] }) {
-  const [completed, setCompleted] = useState({});
-
-  useEffect(() => {
-    setCompleted({});
-  }, [items.join("|")]);
-
-  return (
-    <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-      <div className="mb-4 flex items-center gap-2 text-slate-200">
-        <ClipboardList size={18} className="text-cyan-200" />
-        <h3 className="text-sm font-semibold uppercase tracking-[0.14em]">Required Tasks</h3>
-      </div>
-      <div className="space-y-3">
-        {items.length ? (
-          items.map((item, index) => (
-            <label className="flex cursor-pointer gap-3 rounded-lg border border-white/8 bg-white/5 p-3 text-sm text-slate-100 transition hover:border-cyan-300/25" key={item}>
-              <input checked={Boolean(completed[item])} className="mt-1 size-4 accent-cyan-300" onChange={(event) => setCompleted((state) => ({ ...state, [item]: event.target.checked }))} type="checkbox" />
-              <span className="grid size-6 shrink-0 place-items-center rounded-md border border-cyan-300/25 text-xs text-cyan-100">{index + 1}</span>
-              <span className={`leading-6 ${completed[item] ? "text-slate-400 line-through" : ""}`}>{item}</span>
-            </label>
-          ))
-        ) : (
-          <EmptyText />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function RoadmapPanel({ items = [] }) {
-  return (
-    <section className="rounded-lg border border-cyan-300/20 bg-[#151d3c]/88 p-5">
-      <div className="mb-5 flex items-center gap-2 text-slate-200">
-        <Map size={18} className="text-cyan-200" />
-        <h3 className="text-sm font-semibold uppercase tracking-[0.14em]">Completion Roadmap</h3>
-      </div>
-      <div className="relative space-y-4">
-        <div className="absolute bottom-4 left-3 top-4 w-px bg-cyan-300/25" />
-        {items.length ? (
-          items.map((item, index) => (
-            <div className="relative flex gap-4" key={item}>
-              <span className="z-10 grid size-7 shrink-0 place-items-center rounded-full border border-cyan-200/50 bg-[#111832] text-xs font-bold text-cyan-100">{index + 1}</span>
-              <p className="pt-0.5 text-sm leading-6 text-slate-200">{item}</p>
-            </div>
-          ))
-        ) : (
-          <EmptyText />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function StructurePanel({ items = [] }) {
-  return (
-    <section className="rounded-lg border border-white/10 bg-[#151d3c]/82 p-5">
-      <div className="mb-4 flex items-center gap-2 text-slate-200">
-        <CheckCircle2 size={18} className="text-cyan-200" />
-        <h3 className="text-sm font-semibold uppercase tracking-[0.14em]">Suggested Structure</h3>
-      </div>
-      <div className="space-y-2">
-        {items.length ? (
-          items.map((item) => (
-            <div className="rounded-lg border border-white/8 bg-white/5 px-4 py-3 text-sm text-slate-200" key={item}>{item}</div>
-          ))
-        ) : (
-          <EmptyText />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function TextField({ label, onChange, type = "text", value }) {
-  return (
-    <label className="block">
-      <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</span>
-      <input className="h-11 w-full rounded-lg border border-white/12 bg-[#0c1430]/88 px-3 text-sm text-white outline-none transition focus:border-cyan-300/80" onChange={(event) => onChange(event.target.value)} type={type} value={value} />
+    <label className="field">
+      <span>{label}</span>
+      <input className="input" onChange={onChange} type={type} value={value} {...rest} />
     </label>
   );
 }
 
-function SelectField({ label, onChange, options, value }) {
+function SelectField({ label, onChange, options: choices, value }) {
   return (
-    <label className="block">
-      <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</span>
-      <select className="h-11 w-full rounded-lg border border-white/12 bg-[#0c1430]/88 px-3 text-sm text-white outline-none transition focus:border-cyan-300/80" onChange={(event) => onChange(event.target.value)} value={value}>
-        {options.map((option) => <option key={option}>{option}</option>)}
+    <label className="field">
+      <span>{label}</span>
+      <select className="input" onChange={onChange} value={value}>
+        {choices.map((choice) => (
+          <option key={choice}>{choice}</option>
+        ))}
       </select>
     </label>
   );
 }
 
-function ToggleField({ checked, label, onChange }) {
+function Toggle({ checked, label, onChange }) {
   return (
-    <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/5 p-3 text-sm text-slate-200">
+    <label className="toggle">
+      <input checked={checked} onChange={onChange} type="checkbox" />
+      <span aria-hidden="true" className="toggle-track" />
       <span>{label}</span>
-      <input checked={checked} className="size-4 accent-cyan-300" onChange={(event) => onChange(event.target.checked)} type="checkbox" />
     </label>
   );
 }
 
-function ProfileStat({ label, value }) {
-  return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border border-white/8 bg-white/5 px-3 py-3">
-      <span className="text-slate-400">{label}</span>
-      <span className="text-right text-slate-100">{value}</span>
-    </div>
-  );
-}
+/* =====================================================================
+   Crash screen: shows the real error instead of a blank page
+   ===================================================================== */
 
-function Avatar({ large = false, name, small = false }) {
-  const initials = name
-    .split(" ")
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("") || "U";
+class ErrorBoundary extends React.Component {
+  state = { error: null };
 
-  return (
-    <div className={`grid shrink-0 place-items-center rounded-full border border-white/15 bg-gradient-to-br from-cyan-300 to-violet-500 font-bold text-white ${large ? "size-24 text-3xl" : small ? "size-8 text-xs" : "size-10 text-sm"}`}>
-      {initials}
-    </div>
-  );
-}
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
 
-function IconButton({ icon: Icon, label, onClick }) {
-  return (
-    <button className="grid h-12 w-12 place-items-center rounded-lg border border-white/12 bg-white/6 text-cyan-100 transition hover:bg-white/10" onClick={onClick} title={label} type="button">
-      <Icon size={18} />
-    </button>
-  );
-}
+  componentDidCatch(error, info) {
+    console.error("The app crashed:", error, info?.componentStack);
+  }
 
-function ActionButton({ disabled = false, icon: Icon, label, onClick }) {
-  return (
-    <button className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/6 px-3 text-sm text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-45" disabled={disabled} onClick={onClick} type="button">
-      <Icon size={16} />
-      {label}
-    </button>
-  );
-}
+  resetAndReload = () => {
+    removeKeys(Object.values(storageKeys));
+    window.location.reload();
+  };
 
-function LoadingOverlay() {
-  return (
-    <div className="absolute inset-0 z-20 grid place-items-center bg-[#08142e]/72 backdrop-blur-sm">
-      <div className="rounded-lg border border-cyan-300/25 bg-[#151d3c] px-6 py-5 text-center shadow-glow">
-        <Loader2 className="mx-auto mb-3 animate-spin text-cyan-200" size={34} />
-        <p className="font-semibold text-white">Unpacking the brief</p>
-        <p className="mt-1 text-sm text-slate-300">Extracting tasks, concepts, and a roadmap.</p>
+  render() {
+    if (!this.state.error) return this.props.children;
+
+    return (
+      <div className="crash" role="alert">
+        <h1>Something went wrong</h1>
+        <p className="hint">The page hit an error. Reloading usually fixes it. If it keeps happening, reset the saved data in this browser.</p>
+        <pre>{String(this.state.error?.message || this.state.error)}</pre>
+        <div className="actions">
+          <button className="btn btn-primary" onClick={() => window.location.reload()} type="button">
+            Reload
+          </button>
+          <button className="btn btn-outline" onClick={this.resetAndReload} type="button">
+            Reset saved data and reload
+          </button>
+        </div>
       </div>
-    </div>
-  );
-}
-
-function EmptyText() {
-  return <p className="text-sm text-slate-400">Waiting for analysis.</p>;
-}
-
-function buildContextualAssignment(assignment, settings) {
-  return `${assignment}
-
-Student context:
-- Academic level: ${settings.academicLevel}
-- Referencing style: ${settings.referencingStyle}
-- Preferred output language: ${settings.language}`;
-}
-
-async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.error || "Request failed.");
-  }
-
-  return data;
-}
-
-function authHeaders(token) {
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function upsertUser(users, nextUser) {
-  const withoutUser = users.filter((user) => user.id !== nextUser.id && user.email !== nextUser.email);
-  return [...withoutUser, nextUser];
-}
-
-function isDatabaseUnavailable(error) {
-  return /supabase is not configured|failed to fetch|networkerror/i.test(error.message || "");
-}
-
-function createMarkdown(breakdown) {
-  const list = (items = []) => items.map((item) => `- ${item}`).join("\n");
-
-  return `# ${breakdown.mainTopic || "Unpack.ai Breakdown"}
-
-Generated with: ${breakdown.provider || "Unpack.ai"}
-
-## Summary
-${breakdown.summary || ""}
-
-## Key Concepts
-${list(breakdown.keyConcepts)}
-
-## Keywords
-${list(breakdown.keywords)}
-
-## Required Tasks
-${list(breakdown.requiredTasks)}
-
-## Suggested Structure
-${list(breakdown.suggestedStructure)}
-
-## Completion Plan
-${list(breakdown.completionPlan)}
-`;
-}
-
-function loadHistory() {
-  const stored = loadJson(HISTORY_KEY, []);
-  return Array.isArray(stored) ? stored : [];
-}
-
-function loadJson(key, fallback) {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(key) || "null");
-    return stored ?? fallback;
-  } catch {
-    return fallback;
+    );
   }
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+createRoot(document.getElementById("root")).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>,
+);
