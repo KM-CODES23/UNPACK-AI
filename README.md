@@ -113,6 +113,17 @@ Potential enhancements include:
 
 Unpack.ai is designed primarily for students who want a clearer starting point when working on assignments, projects, and other academic tasks.
 
+
+## 📸 Screenshots
+
+### Sign-in Page
+![Unpack.ai Homepage](screenshots/sign-in.png)
+
+
+### HomePage
+![Unpack.ai Dashboard](screenshots/assignment_breakdown.png)
+
+
 ## 👨‍💻 Developer
 
 **KM CODES**  
@@ -122,7 +133,7 @@ ICT Student | Software Developer
 
 ## 📄 License
 
-A license has not yet been specified. Add a `LICENSE` file to define how others may use, modify, and distribute this project.
+A license has not yet been specified. 
 
 ---
 
